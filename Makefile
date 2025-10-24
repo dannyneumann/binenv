@@ -12,6 +12,8 @@ TIMEOUT = 15
 V = 0
 Q = $(if $(filter 1,$V),,@)
 M = $(shell printf "\033[34;1m▶\033[0m")
+HOST_OS   := $(shell $(GO) env GOOS)
+HOST_ARCH := $(shell $(GO) env GOARCH)
 
 export GO111MODULE=on
 
@@ -52,6 +54,10 @@ darwin: fmt lint $(BIN) ; $(info $(M) building static executable for MacOS…) @
 		-tags release -a \
 		-ldflags '-w -extldflags "-static" -X github.com/devops-works/binenv/cmd.Version=$(VERSION) -X github.com/devops-works/binenv/cmd.BuildDate=$(DATE)' \
 		-o $(BIN)/$(PACKAGE)-darwin-amd64
+	$Q env GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 $(GO) build \
+		-tags release -a \
+		-ldflags '-w -extldflags "-static" -X github.com/devops-works/binenv/cmd.Version=$(VERSION) -X github.com/devops-works/binenv/cmd.BuildDate=$(DATE)' \
+		-o $(BIN)/$(PACKAGE)-darwin-arm64
 
 windows: fmt lint clean $(BIN) ; $(info $(M) building static executable for Windoze…) @ ## Build program binary
 	$Q env GOOS=windows GOARCH=amd64 CGO_ENABLED=0 $(GO) build \
@@ -63,7 +69,7 @@ release: windows darwin linux freebsd ; $(info $(M) stripping release executable
 	$Q strip $(BIN)/$(PACKAGE)-linux-amd64
 	$Q strip $(BIN)/$(PACKAGE)-freebsd-amd64
 	$Q (cd bin && sha256sum * > SHA256SUMS.txt)
-	$Q cp $(BIN)/$(PACKAGE)-linux-amd64 $(BIN)/$(PACKAGE)
+	$Q cp $(BIN)/$(PACKAGE)-$(HOST_OS)-$(HOST_ARCH) $(BIN)/$(PACKAGE)
 	# $Q gzip $(BIN)/$(PACKAGE)-linux-amd64
 	# $Q gzip $(BIN)/$(PACKAGE)-linux-386
 	# $Q gzip $(BIN)/$(PACKAGE)-darwin-amd64
@@ -99,7 +105,7 @@ $(BIN):
 
 # Tools
 
-GOLINT = $(GO) run golang.org/x/lint/golint@latest
+VET_FLAGS ?=
 GOCOVMERGE = $(GO) run github.com/wadey/gocovmerge@latest
 GOCOV = $(GO) run github.com/axw/gocov/gocov@latest
 GOCOVXML = $(GO) run github.com/AlekSi/gocov-xml@latest
@@ -145,8 +151,8 @@ test-coverage: fmt lint ; $(info $(M) running coverage tests…) @ ## Run covera
 	$Q $(GOCOV) convert $(COVERAGE_PROFILE) | $(GOCOVXML) > $(COVERAGE_XML)
 
 .PHONY: lint
-lint: ; $(info $(M) running golint…) @ ## Run golint
-	$Q $(GOLINT) -set_exit_status $(PKGS)
+lint: ; $(info $(M) running go vet…) @ ## Run go vet
+	$Q $(GO) vet $(VET_FLAGS) ./...
 
 .PHONY: outdated
 outdated: ; $(info $(M) running go-mod-outdated…) @ ## Run go-mod-outdated
