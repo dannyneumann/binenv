@@ -73,6 +73,7 @@ release: windows darwin linux freebsd ; $(info $(M) stripping release executable
 	# $Q gzip $(BIN)/$(PACKAGE)-linux-amd64
 	# $Q gzip $(BIN)/$(PACKAGE)-linux-386
 	# $Q gzip $(BIN)/$(PACKAGE)-darwin-amd64
+	# $Q gzip $(BIN)/$(PACKAGE)-darwin-arm64
 	# $Q gzip $(BIN)/$(PACKAGE)-win-amd64
 	$Q $(BIN)/$(PACKAGE) version
 
