@@ -152,6 +152,9 @@ If you are using a different shell, skip adding completion to your `.${SHELL}rc`
 
 ## Install
 
+Building binenv from source requires Go **1.25.3** or newer. Pre-built binaries
+are available for download on the [releases page](https://github.com/devops-works/binenv/releases).
+
 ### User install
 
 - download a suitable `binenv` (yes, but wait !) for your architecture/OS at
@@ -297,6 +300,11 @@ To update distributions **and** their versions:
 ```bash
 binenv update --all # or -a
 ```
+
+If the update cannot reach GitHub (for example when working offline), `binenv`
+falls back to the embedded copy of `distributions.yaml` and `cache.json`. You
+can still refresh locally cached versions later with `binenv update --all` once
+connectivity is restored.
 
 ##### Using custom distributions file (and private GitLab repos)
 
@@ -614,11 +622,21 @@ version.BuildInfo{Version:"v3.6.3", GitCommit:"d506314abfb5d21419df8c7e7e6801237
 
 Other environment variables exists to control `binenv` behavior:
 
-- `BINENV_GLOBAL`: forces `binenv` to run un global mode (same as `-g`); see
+- `BINENV_GLOBAL`: forces `binenv` to run in global mode (same as `-g`); see
   [SYSTEM.md](./SYSTEM.md) for more information on this mode.
-- `BINENV_VERBOSE`: same as `-v`
+- `BINENV_VERBOSE`: same as `-v`.
+- `BINENV_HTTP_TIMEOUT`: override the HTTP timeout used for distribution and cache
+  downloads. Accepts Go duration strings (e.g. `30s`, `1m`). Defaults to `30s`.
+- `BINENV_HTTP_RETRIES`: number of retry attempts for transient HTTP failures.
+  Defaults to `2`.
+- `BINENV_HTTP_BACKOFF`: base backoff duration between retry attempts. Accepts Go
+  duration strings and defaults to `500ms`.
+- `BINENV_UPDATE_CONCURRENCY`: number of parallel workers used while refreshing
+  the distributions cache. Defaults to `8`.
+- `BINENV_NO_PROGRESS`: when set (or when running in CI), disables progress bar
+  rendering to keep logs clean.
 - `BASH_COMP_DEBUG_FILE`: if set, will write debug information for bash
-  completion to this file
+  completion to this file.
 
 ## Removing binenv stuff
 
