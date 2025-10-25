@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+
+	"github.com/devops-works/binenv/internal/httpclient"
 )
 
 var (
@@ -39,6 +41,7 @@ type GitlabRelease struct {
 	exclude     string
 	versionFrom string
 	tokenEnv    string
+	client      *httpclient.Client
 }
 
 // Get returns a list of available versions
@@ -67,9 +70,12 @@ func (g GitlabRelease) doGet(ctx context.Context, page int) ([]string, int, erro
 	logger := zerolog.Ctx(ctx).With().Str("func", "GitlabRelease.doGet").Logger()
 
 	next := 0
-	client := &http.Client{}
+	client := g.client
+	if client == nil {
+		client = httpclient.Default()
+	}
 
-	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s?page=%d", g.url, page), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s?page=%d", g.url, page), nil)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -79,7 +85,6 @@ func (g GitlabRelease) doGet(ctx context.Context, page int) ([]string, int, erro
 	}
 
 	if g.tokenEnv != "" {
-		fmt.Println("tokenEnv set to", g.tokenEnv)
 		token := os.Getenv(g.tokenEnv)
 		if token == "" {
 			return nil, 0, fmt.Errorf("token env var %s is not defined; did you export it ?", g.tokenEnv)
@@ -87,7 +92,7 @@ func (g GitlabRelease) doGet(ctx context.Context, page int) ([]string, int, erro
 		req.Header.Set("PRIVATE-TOKEN", token)
 	}
 
-	resp, err := client.Do(req)
+	resp, err := client.Do(ctx, req)
 	if err != nil {
 		return nil, 0, err
 	}

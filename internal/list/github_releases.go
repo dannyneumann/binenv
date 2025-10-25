@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+
+	"github.com/devops-works/binenv/internal/httpclient"
 )
 
 var (
@@ -38,6 +40,7 @@ type GithubRelease struct {
 	prefix      string
 	exclude     string
 	versionFrom string
+	client      *httpclient.Client
 }
 
 // Get returns a list of available versions
@@ -66,11 +69,14 @@ func (g GithubRelease) doGet(ctx context.Context, page int) ([]string, int, erro
 	logger := zerolog.Ctx(ctx).With().Str("func", "GithubRelease.doGet").Logger()
 
 	next := 0
-	client := &http.Client{}
+	client := g.client
+	if client == nil {
+		client = httpclient.Default()
+	}
 
 	logger.Debug().Msgf("fetching versions from %s", g.url)
 
-	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s?page=%d", g.url, page), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s?page=%d", g.url, page), nil)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -79,7 +85,7 @@ func (g GithubRelease) doGet(ctx context.Context, page int) ([]string, int, erro
 		req.Header.Set("Authorization", "token "+token)
 	}
 
-	resp, err := client.Do(req)
+	resp, err := client.Do(ctx, req)
 	if err != nil {
 		return nil, 0, err
 	}

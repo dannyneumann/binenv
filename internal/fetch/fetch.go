@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/devops-works/binenv/internal/httpclient"
 	"github.com/devops-works/binenv/internal/mapping"
 )
 
@@ -41,6 +42,7 @@ func (r Fetch) Factory() (Fetcher, error) {
 		return Download{
 			url:     r.URL,
 			headers: headers,
+			client:  httpclient.Default(),
 		}, nil
 	}
 }

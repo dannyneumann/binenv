@@ -11,6 +11,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/schollz/progressbar/v3"
 
+	"github.com/devops-works/binenv/internal/httpclient"
 	"github.com/devops-works/binenv/internal/mapping"
 	"github.com/devops-works/binenv/internal/tpl"
 )
@@ -19,6 +20,7 @@ import (
 type Download struct {
 	url     string
 	headers map[string]string
+	client  *httpclient.Client
 }
 
 // Fetch gets the package and returns location of downloaded file
@@ -34,7 +36,7 @@ func (d Download) Fetch(ctx context.Context, dist, v string, mapper mapping.Mapp
 
 	logger.Debug().Msgf("fetching version %q for arch %q and OS %q at %s", v, runtime.GOARCH, runtime.GOOS, url)
 
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return "", err
 	}
@@ -43,7 +45,12 @@ func (d Download) Fetch(ctx context.Context, dist, v string, mapper mapping.Mapp
 		req.Header.Add(k, v)
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	client := d.client
+	if client == nil {
+		client = httpclient.Default()
+	}
+
+	resp, err := client.Do(ctx, req)
 	if err != nil {
 		return "", err
 	}
@@ -60,14 +67,16 @@ func (d Download) Fetch(ctx context.Context, dist, v string, mapper mapping.Mapp
 
 	defer tmpfile.Close()
 
-	bar := progressbar.DefaultBytes(
-		resp.ContentLength,
-		fmt.Sprintf("fetching %s version %s", dist, v),
-	)
-	io.Copy(io.MultiWriter(tmpfile, bar), resp.Body)
+	writer := io.Writer(tmpfile)
+	if resp.ContentLength > 0 {
+		bar := progressbar.DefaultBytes(
+			resp.ContentLength,
+			fmt.Sprintf("fetching %s version %s", dist, v),
+		)
+		writer = io.MultiWriter(tmpfile, bar)
+	}
 
-	// Write the body to file
-	_, err = io.Copy(tmpfile, resp.Body)
+	_, err = io.Copy(writer, resp.Body)
 
 	return tmpfile.Name(), err
 }

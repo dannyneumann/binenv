@@ -2,6 +2,8 @@ package list
 
 import (
 	"context"
+
+	"github.com/devops-works/binenv/internal/httpclient"
 )
 
 // Lister should return a list of available release versions
@@ -21,7 +23,10 @@ type List struct {
 }
 
 // Factory returns instances that comply to Lister interface
-func (l List) Factory() Lister {
+func (l List) Factory(client *httpclient.Client) Lister {
+	if client == nil {
+		client = httpclient.Default()
+	}
 	switch l.Type {
 	case "github-releases":
 		return GithubRelease{
@@ -29,6 +34,7 @@ func (l List) Factory() Lister {
 			prefix:      l.Prefix,
 			versionFrom: l.VersionFrom,
 			exclude:     l.Exclude,
+			client:      client,
 		}
 	case "gitlab-releases":
 		return GitlabRelease{
@@ -37,6 +43,7 @@ func (l List) Factory() Lister {
 			versionFrom: l.VersionFrom,
 			exclude:     l.Exclude,
 			tokenEnv:    l.TokenEnv,
+			client:      client,
 		}
 	case "static":
 		return Static{

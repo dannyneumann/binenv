@@ -12,19 +12,24 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	gov "github.com/hashicorp/go-version"
-	"github.com/mitchellh/go-homedir"
 	"github.com/rs/zerolog"
 	"github.com/schollz/progressbar/v3"
 	"gopkg.in/yaml.v2"
 
+	distembed "github.com/devops-works/binenv/distributions"
 	"github.com/devops-works/binenv/internal/fetch"
+	"github.com/devops-works/binenv/internal/httpclient"
 	"github.com/devops-works/binenv/internal/install"
 	"github.com/devops-works/binenv/internal/list"
+
+	"golang.org/x/sync/errgroup"
 
 	"github.com/logrusorgru/aurora"
 
@@ -37,12 +42,17 @@ import (
 // Since master is always behind (or at) develop, it ensures we always have
 // cache for listed entries
 const (
-	distributionsURL = "https://raw.githubusercontent.com/devops-works/binenv/master/distributions/distributions.yaml"
-	cacheURL         = "https://raw.githubusercontent.com/devops-works/binenv/develop/distributions/cache.json"
-	globalBindir     = "/var/lib/binenv"
-	globalCachedir   = "/var/cache/binenv"
-	globalConfigdir  = "/var/lib/binenv/config"
-	globalLinkdir    = "/usr/local/bin"
+	distributionsURL         = "https://raw.githubusercontent.com/devops-works/binenv/master/distributions/distributions.yaml"
+	cacheURL                 = "https://raw.githubusercontent.com/devops-works/binenv/develop/distributions/cache.json"
+	globalBindir             = "/var/lib/binenv"
+	globalCachedir           = "/var/cache/binenv"
+	globalConfigdir          = "/var/lib/binenv/config"
+	globalLinkdir            = "/usr/local/bin"
+	httpRequestTimeout       = 30 * time.Second
+	defaultUpdateConcurrency = 8
+	updateConcurrencyEnv     = "BINENV_UPDATE_CONCURRENCY"
+	disableProgressEnv       = "BINENV_NO_PROGRESS"
+	ciEnv                    = "CI"
 )
 
 // App implements the core logic
@@ -64,7 +74,9 @@ type App struct {
 	cachedir  string
 	configdir string
 
-	logger zerolog.Logger
+	logger          zerolog.Logger
+	httpClient      *httpclient.Client
+	disableProgress bool
 }
 
 // flags holds App boolean flags
@@ -73,18 +85,13 @@ type flags struct {
 	justExpand bool
 }
 
-type jobResult struct {
-	distribution string
-	versions     []string
-}
-
 var (
 	// ErrAlreadyInstalled is returned when the requested version is already installed
 	ErrAlreadyInstalled = errors.New("version already installed")
 )
 
 // New creates a new App
-func New() (*App, error) {
+func New(options ...func(*App) error) (*App, error) {
 	a := &App{
 		mappers:    make(map[string]mapping.Remapper),
 		installers: make(map[string]install.Installer),
@@ -99,6 +106,20 @@ func New() (*App, error) {
 
 	// Default to warn log level
 	a.logger = a.logger.Level(zerolog.InfoLevel)
+	a.httpClient = httpclient.Default()
+	a.concurrency = defaultUpdateConcurrency
+	a.disableProgress = shouldDisableProgress()
+	if value, ok := os.LookupEnv(updateConcurrencyEnv); ok {
+		if parsed, err := strconv.Atoi(strings.TrimSpace(value)); err == nil && parsed > 0 {
+			a.concurrency = parsed
+		}
+	}
+
+	for _, opt := range options {
+		if err := opt(a); err != nil {
+			return nil, err
+		}
+	}
 	return a, nil
 }
 
@@ -669,116 +690,113 @@ func (a *App) Update(definitions, all bool, nocache bool, which ...string) error
 
 func (a *App) updateGithub() error {
 	a.logger.Info().Msgf("retrieving distribution cache from %s", cacheURL)
-	resp, err := http.Get(cacheURL)
+
+	data, usedFallback, err := a.downloadOrFallback(cacheURL, "distribution cache", distembed.CacheJSON)
 	if err != nil {
 		return err
 	}
 
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	count, err := a.loadCacheData(data)
 	if err != nil {
+		a.logger.Error().Err(err).Msg(`unable to unmarshal distribution cache; try to "binenv update" locally`)
 		return err
 	}
 
-	err = json.Unmarshal([]byte(body), &a.cache)
-	if err != nil {
-		a.logger.Error().Err(err).Msg(`unable to unmarshal Github cache; try to "binenv update" locally`)
-		return err
+	if usedFallback {
+		a.logger.Info().Msgf("using embedded distribution cache with %d entries", count)
+	} else {
+		a.logger.Info().Msgf("fetched updates for %d distributions", count)
 	}
-
-	a.logger.Info().Msgf("fetched updates for %d distributions", len(a.cache))
 
 	return nil
 }
 
-func (a *App) fetcher(id int, jobs <-chan string, res chan<- jobResult, timeout time.Duration) {
-	a.logger.Debug().Msgf("fetcher %d starting", id)
-	for d := range jobs {
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-
-		var err error
-
-		r := jobResult{
-			distribution: d,
-		}
-
-		subctx := a.logger.WithContext(ctx)
-		r.versions, err = a.listers[d].Get(subctx)
-
-		if errors.Is(err, list.ErrGithubRateLimitClose) || errors.Is(err, list.ErrGithubRateLimited) {
-			a.logger.Error().Err(err).Msgf("rate limit prevents fetching versions for %q", d)
-			// return err
-			cancel()
-			continue
-		}
-		if err != nil {
-			a.logger.Error().Err(err).Msgf("unable to fetch versions for %q", d)
-			// continue
-		}
-
-		if len(r.versions) == 0 {
-			a.logger.Warn().Msgf("found no versions for %q", d)
-		} else {
-			a.logger.Debug().Msgf("found versions %q for %q", strings.Join(r.versions, ","), d)
-		}
-
-		res <- r
-
-		cancel()
-	}
+type progressCounter interface {
+	Add(int) error
 }
 
+type noopProgress struct{}
+
+func (noopProgress) Add(int) error { return nil }
+
 func (a *App) updateLocally(which ...string) error {
-	bar := progressbar.Default(int64(len(which)), "updating distributions")
-
-	jobs := make(chan string)
-	res := make(chan jobResult, 1000)
-	timeout := 1 * time.Second
-
-	for w := 1; w <= a.concurrency; w++ {
-		go a.fetcher(w, jobs, res, timeout)
+	var counter progressCounter = noopProgress{}
+	if !a.disableProgress {
+		counter = progressbar.Default(int64(len(which)), "updating distributions")
 	}
 
-	count := 0
+	timeout := 1 * time.Second
+	baseCtx := context.Background()
+	group, groupCtx := errgroup.WithContext(baseCtx)
+	if a.concurrency > 0 {
+		group.SetLimit(a.concurrency)
+	}
+
+	var cacheMu sync.Mutex
 	for _, d := range which {
-		bar.Add(1)
+		if err := counter.Add(1); err != nil {
+			a.logger.Debug().Err(err).Msg("unable to advance progress bar")
+		}
 
 		a.logger.Debug().Msgf("feching available versions for %q", d)
-		if _, ok := a.listers[d]; !ok {
+		lister, ok := a.listers[d]
+		if !ok {
 			a.logger.Error().Msgf("no distribution named %q", d)
 			continue
 		}
 
-		jobs <- d
-		count++
-	}
+		dist := d
+		currentLister := lister
+		group.Go(func() error {
+			ctx, cancel := context.WithTimeout(groupCtx, timeout)
+			defer cancel()
 
-	close(jobs)
-
-	for c := 0; c < count; c++ {
-		r := <-res
-
-		// Skip this entry if no versions are provided
-		// see #157, #159, #162...
-		if len(r.versions) == 0 {
-			a.logger.Warn().Msgf("no versions found for %s; keeping previous versions %s", r.distribution, strings.Join(a.cache[r.distribution], ","))
-			continue
-		}
-
-		// Flush cache entry if
-		a.cache[r.distribution] = []string{}
-
-		// Convert versions to canonical form
-		for _, v := range r.versions {
-			version, err := gov.NewVersion(v)
-			if err != nil {
-				a.logger.Debug().Err(err).Msgf("ignoring invalid version for %q", r.distribution)
-				continue
+			subctx := a.logger.WithContext(ctx)
+			versions, err := currentLister.Get(subctx)
+			if errors.Is(err, list.ErrGithubRateLimitClose) || errors.Is(err, list.ErrGithubRateLimited) {
+				a.logger.Error().Err(err).Msgf("rate limit prevents fetching versions for %q", dist)
+				return nil
 			}
-			a.cache[r.distribution] = append(a.cache[r.distribution], version.String())
-		}
+			if err != nil {
+				a.logger.Error().Err(err).Msgf("unable to fetch versions for %q", dist)
+			}
+
+			if len(versions) == 0 {
+				cacheMu.Lock()
+				prev := append([]string(nil), a.cache[dist]...)
+				cacheMu.Unlock()
+				a.logger.Warn().Msgf("no versions found for %s; keeping previous versions %s", dist, strings.Join(prev, ","))
+				return nil
+			}
+
+			cleaned := make([]string, 0, len(versions))
+			for _, v := range versions {
+				version, err := gov.NewVersion(v)
+				if err != nil {
+					a.logger.Debug().Err(err).Msgf("ignoring invalid version for %q", dist)
+					continue
+				}
+				cleaned = append(cleaned, version.String())
+			}
+
+			if len(cleaned) == 0 {
+				cacheMu.Lock()
+				prev := append([]string(nil), a.cache[dist]...)
+				cacheMu.Unlock()
+				a.logger.Warn().Msgf("no valid versions found for %s; keeping previous versions %s", dist, strings.Join(prev, ","))
+				return nil
+			}
+
+			cacheMu.Lock()
+			a.cache[dist] = cleaned
+			cacheMu.Unlock()
+
+			a.logger.Debug().Msgf("found versions %q for %q", strings.Join(cleaned, ","), dist)
+			return nil
+		})
 	}
-	return nil
+
+	return group.Wait()
 }
 
 // Versions fetches available versions for the application
@@ -1056,45 +1074,143 @@ func (a *App) readDistributions() error {
 func (a *App) fetchDistributions(conf string) error {
 	a.logger.Info().Msg("updating distribution list")
 	a.logger.Debug().Msgf("retrieving distribution list from %s", distributionsURL)
-	resp, err := http.Get(distributionsURL)
+
+	data, usedFallback, err := a.downloadOrFallback(distributionsURL, "distribution list", distembed.DistributionsYAML)
 	if err != nil {
 		return err
 	}
 
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	if err := a.writeDistributions(conf, data); err != nil {
+		return err
+	}
+
+	count, err := a.loadDistributionsData(data)
 	if err != nil {
 		return err
 	}
 
-	var mode os.FileMode = 0750
+	if usedFallback {
+		a.logger.Info().Msgf("using embedded distribution list with %d entries", count)
+	} else {
+		a.logger.Info().Msgf("retrieved distribution list with %d entries", count)
+	}
+
+	return nil
+}
+
+func (a *App) loadCacheData(data []byte) (int, error) {
+	tmp := make(map[string][]string)
+	if err := json.Unmarshal(data, &tmp); err != nil {
+		return 0, err
+	}
+	a.cache = tmp
+	return len(tmp), nil
+}
+
+func (a *App) loadDistributionsData(data []byte) (int, error) {
+	dsts := &Distributions{}
+	if err := yaml.Unmarshal(data, dsts); err != nil {
+		return 0, err
+	}
+	if dsts.Sources == nil {
+		dsts.Sources = make(map[string]Sources)
+	}
+	a.def = dsts
+	return len(dsts.Sources), nil
+}
+
+func (a *App) writeDistributions(conf string, data []byte) error {
+	mode := os.FileMode(0750)
 	if a.global {
 		mode = 0755
 	}
-	err = os.MkdirAll(a.configdir, mode)
-	if err != nil {
+	if err := os.MkdirAll(a.configdir, mode); err != nil {
 		return fmt.Errorf("unable to create configuration directory '%s': %w", a.configdir, err)
 	}
 
-	mode = 0640
+	fileMode := os.FileMode(0640)
 	if a.global {
-		mode = 0644
+		fileMode = 0644
 	}
 
-	f, err := os.OpenFile(conf, os.O_CREATE|os.O_WRONLY, mode)
+	f, err := os.OpenFile(conf, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, fileMode)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 
-	f.Write(body)
-
-	err = yaml.Unmarshal([]byte(body), &a.def)
-	if err != nil {
+	if _, err := f.Write(data); err != nil {
 		return err
 	}
-
 	return nil
+}
+
+func (a *App) downloadOrFallback(url, resource string, fallback []byte) ([]byte, bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), httpRequestTimeout)
+	defer cancel()
+
+	body, status, err := a.fetchRemote(ctx, url)
+	if err == nil && status == http.StatusOK {
+		return body, false, nil
+	}
+
+	if err != nil {
+		a.logger.Warn().Err(err).Msgf("unable to download %s from %s; using embedded fallback", resource, url)
+	} else {
+		a.logger.Warn().Msgf("unexpected status code %d when fetching %s from %s; using embedded fallback", status, resource, url)
+	}
+
+	if len(fallback) == 0 {
+		if err != nil {
+			return nil, false, err
+		}
+		return nil, false, fmt.Errorf("unexpected status code %d when fetching %s", status, url)
+	}
+
+	return fallback, true, nil
+}
+
+func (a *App) fetchRemote(ctx context.Context, url string) ([]byte, int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	resp, err := a.httpClient.Do(ctx, req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, resp.StatusCode, err
+	}
+
+	return body, resp.StatusCode, nil
+}
+
+func shouldDisableProgress() bool {
+	if value, ok := os.LookupEnv(disableProgressEnv); ok {
+		trimmed := strings.TrimSpace(value)
+		if trimmed != "" {
+			if parsed, err := strconv.ParseBool(trimmed); err == nil {
+				return parsed
+			}
+			return true
+		}
+	}
+	if value, ok := os.LookupEnv(ciEnv); ok {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			return false
+		}
+		if parsed, err := strconv.ParseBool(trimmed); err == nil {
+			return parsed
+		}
+		return true
+	}
+	return false
 }
 
 func (a *App) getBinDirFor(dist string) string {
@@ -1126,7 +1242,9 @@ func (a *App) GuessBestVersionFor(dist, dir, stop string, versions []string) (st
 
 	// If stop is "", we enforce stopping in home directory
 	if stop == "" {
-		stop, _ = homedir.Dir()
+		if home, err := os.UserHomeDir(); err == nil {
+			stop = home
+		}
 	}
 	stop = filepath.Clean(stop)
 	dir = filepath.Clean(dir)
@@ -1189,7 +1307,10 @@ func (a *App) GuessBestVersionFor(dist, dir, stop string, versions []string) (st
 // a distribution and a version list.
 // If no match we return the latest version we have
 func (a *App) GuessBestVersionFor2(dist, dir string, versions []string) (string, string) {
-	home, _ := homedir.Dir()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = ""
+	}
 	home = filepath.Clean(home)
 	dir = filepath.Clean(dir)
 
@@ -1366,7 +1487,7 @@ func (a *App) createMappers() {
 
 func (a *App) createListers() {
 	for k, v := range a.def.Sources {
-		l := v.List.Factory()
+		l := v.List.Factory(a.httpClient)
 		if l == nil {
 			a.logger.Warn().Msgf("%q list method for %q is not implemented", v.List.Type, k)
 			continue
@@ -1391,6 +1512,35 @@ func (a *App) createFetchers() error {
 }
 
 // Functional options
+
+// WithHTTPClient overrides the default HTTP client instance.
+func WithHTTPClient(client *httpclient.Client) func(*App) error {
+	return func(a *App) error {
+		if client == nil {
+			return errors.New("http client must not be nil")
+		}
+		a.httpClient = client
+		return nil
+	}
+}
+
+// WithProgressDisabled toggles progress bar rendering.
+func WithProgressDisabled(disable bool) func(*App) error {
+	return func(a *App) error {
+		a.disableProgress = disable
+		return nil
+	}
+}
+
+// WithConcurrency overrides the default number of workers used during updates.
+func WithConcurrency(workers int) func(*App) error {
+	return func(a *App) error {
+		if workers > 0 {
+			a.concurrency = workers
+		}
+		return nil
+	}
+}
 
 // WithDiscard sets the log output to /dev/null
 func WithDiscard() func(*App) error {
